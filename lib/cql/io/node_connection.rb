@@ -8,14 +8,11 @@ module Cql
   module Io
     # @private
     class NodeConnection
-      attr_reader :keyspace
-
       def initialize(*args)
         @host, @port, @connection_timeout = args
         @connected_future = Future.new
         @io = nil
         @addrinfo = nil
-        @keyspace = nil
         @write_buffer = ''
         @read_buffer = ''
         @current_frame = Protocol::ResponseFrame.new(@read_buffer)
@@ -32,7 +29,7 @@ module Cql
           @io = Socket.new(address_family, socket_type, 0)
           @io.connect_nonblock(@sockaddr)
         rescue Errno::EINPROGRESS
-          # ok
+          # NOTE not connected yet, this is expected
         rescue SystemCallError, SocketError => e
           fail_connection!(e)
         end
@@ -99,11 +96,7 @@ module Cql
           if stream_id == EVENT_STREAM_ID
             @event_listeners[:event].each { |listener| listener.call(@current_frame.body) }
           elsif @response_tasks[stream_id]
-            body = @current_frame.body
-            if body.instance_of? Cql::Protocol::SetKeyspaceResultResponse
-              @keyspace = body.keyspace
-            end
-            @response_tasks[stream_id].complete!([body, connection_id])
+            @response_tasks[stream_id].complete!([@current_frame.body, connection_id])
             @response_tasks[stream_id] = nil
           else
             # TODO dropping the request on the floor here, but we didn't send it
@@ -131,25 +124,26 @@ module Cql
           @io.connect_nonblock(@sockaddr)
           succeed_connection!
         end
+      rescue Errno::EALREADY
+        # NOTE still not connected
       rescue Errno::EISCONN
-        # ok
         succeed_connection!
       rescue SystemCallError, SocketError => e
         fail_connection!(e)
       end
 
-      def close
+      def close(error=nil)
         if @io
           begin
             @io.close
           rescue SystemCallError
-            # nothing to do, it wasn't open
+            # NOTE nothing to do, it wasn't open
           end
           if connecting?
             succeed_connection!
           end
           @io = nil
-          @event_listeners[:close].each { |listener| listener.call(self) }
+          @event_listeners[:close].each { |listener| listener.call(error) }
         end
       end
 
@@ -199,7 +193,7 @@ module Cql
         @response_tasks.each do |listener|
           listener.fail!(error) if listener
         end
-        close
+        close(error)
       end
 
       def next_stream_id
